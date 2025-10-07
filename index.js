@@ -7,9 +7,6 @@ const multer = require('multer');
 const fs = require('fs');
 require('dotenv').config();
 
-// ✅ Polyfill fetch for Node <18 (Render fix)
-const fetch = (...args) => import('node-fetch').then(({ default: fetch }) => fetch(...args));
-
 const app = express();
 app.use(cors());
 app.use(express.json());
@@ -18,8 +15,7 @@ app.use(express.json());
 mongoose.connect(process.env.MONGODB_URI, {
   useNewUrlParser: true,
   useUnifiedTopology: true,
-}).then(() => console.log('✅ MongoDB Connected'))
-.catch(err => console.error('❌ MongoDB Error:', err));
+}).then(() => console.log('✅ MongoDB Connected'));
 
 // Cloudinary Config
 cloudinary.config({
@@ -88,22 +84,30 @@ bot.on('text', async (ctx) => {
 
   switch (userState.step) {
     case 'welcomeText':
-      if (text.length > 100) return ctx.reply('❌ Too long! Max 100 chars:');
+      if (text.length > 100) {
+        await ctx.reply('❌ Too long! Max 100 chars:');
+        return;
+      }
       userState.eventData.welcomeText = text;
       userState.step = 'description';
       await ctx.reply('✅ Now enter description (max 200 chars):');
       break;
 
     case 'description':
-      if (text.length > 200) return ctx.reply('❌ Too long! Max 200 chars:');
+      if (text.length > 200) {
+        await ctx.reply('❌ Too long! Max 200 chars:');
+        return;
+      }
       userState.eventData.description = text;
       userState.step = 'backgroundImage';
       await ctx.reply('✅ Now send background image:');
       break;
 
     case 'serviceType':
-      if (!['/both', '/viewalbum', '/uploadpics'].includes(text))
-        return ctx.reply('❌ Use /both, /viewalbum, or /uploadpics');
+      if (!['/both', '/viewalbum', '/uploadpics'].includes(text)) {
+        await ctx.reply('❌ Use /both, /viewalbum, or /uploadpics');
+        return;
+      }
       userState.eventData.serviceType = text.replace('/', '');
       userState.step = 'uploadLimit';
       await ctx.reply('✅ Enter upload limit (1-20):');
@@ -111,8 +115,10 @@ bot.on('text', async (ctx) => {
 
     case 'uploadLimit':
       const limit = parseInt(text);
-      if (isNaN(limit) || limit < 1 || limit > 20)
-        return ctx.reply('❌ Enter number 1-20:');
+      if (isNaN(limit) || limit < 1 || limit > 20) {
+        await ctx.reply('❌ Enter number 1-20:');
+        return;
+      }
       userState.eventData.uploadLimit = limit;
       userState.step = 'preloadedPhotos';
       await ctx.reply('✅ Send preloaded photos (type /done when finished):');
@@ -121,12 +127,14 @@ bot.on('text', async (ctx) => {
     case 'eventIdForDisable':
       try {
         const event = await Event.findOne({ eventId: text });
-        if (!event) return ctx.reply('❌ Event not found');
+        if (!event) {
+          await ctx.reply('❌ Event not found');
+          return;
+        }
         event.status = 'disabled';
         await event.save();
         await ctx.reply(`✅ Uploads disabled for event: ${text}`);
       } catch (error) {
-        console.error('Disable error:', error);
         await ctx.reply('❌ Failed to disable event');
       }
       userStates.delete(userId);
@@ -143,11 +151,11 @@ bot.on('photo', async (ctx) => {
   if (!userState) return;
 
   try {
-    const fileId = ctx.message.photo.at(-1).file_id;
+    const fileId = ctx.message.photo[ctx.message.photo.length - 1].file_id;
     const fileLink = await bot.telegram.getFileLink(fileId);
     const tempPath = `temp-${Date.now()}.jpg`;
     
-    // Download image using fetch
+    // Download image
     const response = await fetch(fileLink.href);
     const buffer = await response.arrayBuffer();
     fs.writeFileSync(tempPath, Buffer.from(buffer));
@@ -167,7 +175,6 @@ bot.on('photo', async (ctx) => {
     fs.unlinkSync(tempPath);
     userStates.set(userId, userState);
   } catch (error) {
-    console.error('Photo upload error:', error);
     await ctx.reply('❌ Failed to upload image');
   }
 });
@@ -197,7 +204,6 @@ bot.command('done', async (ctx) => {
       const eventUrl = `${process.env.FRONTEND_URL}/event/${userState.eventData.eventId}`;
       await ctx.reply(`🎊 Event Complete!\nID: ${userState.eventData.eventId}\nURL: ${eventUrl}\nUse /disable to stop uploads.`);
     } catch (error) {
-      console.error('Event creation error:', error);
       await ctx.reply('❌ Failed to create event');
     }
     userStates.delete(userId);
@@ -233,7 +239,6 @@ app.get('/api/events/:eventId', async (req, res) => {
       uploadEnabled: event.status === 'active' && event.serviceType !== 'viewalbum'
     });
   } catch (error) {
-    console.error('Events API error:', error);
     res.status(500).json({ error: 'Server error' });
   }
 });
@@ -274,8 +279,18 @@ app.post('/api/upload/:eventId', upload.single('photo'), async (req, res) => {
 
     res.json({ success: true, photo });
   } catch (error) {
-    console.error('Upload API error:', error);
     res.status(500).json({ error: 'Upload failed' });
+  }
+});
+
+// Get Album Photos
+app.get('/api/album/:eventId', async (req, res) => {
+  try {
+    const preloadedPhotos = await Photo.find({ eventId: req.params.eventId, uploadType: 'preloaded' }).sort({ uploadedAt: -1 });
+    const guestPhotos = await Photo.find({ eventId: req.params.eventId, uploadType: 'guest', approved: true }).sort({ uploadedAt: -1 });
+    res.json({ preloadedPhotos, guestPhotos });
+  } catch (error) {
+    res.status(500).json({ error: 'Server error' });
   }
 });
 
