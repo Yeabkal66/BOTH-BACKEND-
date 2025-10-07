@@ -1,5 +1,3 @@
-require('dotenv').config();
-
 const express = require('express');
 const mongoose = require('mongoose');
 const cors = require('cors');
@@ -7,7 +5,10 @@ const { Telegraf } = require('telegraf');
 const cloudinary = require('cloudinary').v2;
 const multer = require('multer');
 const fs = require('fs');
-const https = require('https');
+require('dotenv').config();
+
+// ✅ Polyfill fetch for Node <18 (Render fix)
+const fetch = (...args) => import('node-fetch').then(({ default: fetch }) => fetch(...args));
 
 const app = express();
 app.use(cors());
@@ -28,25 +29,20 @@ cloudinary.config({
 });
 
 // MongoDB Models
-const eventSchema = new mongoose.Schema({
+const Event = mongoose.model('Event', new mongoose.Schema({
   eventId: { type: String, required: true, unique: true },
   welcomeText: { type: String, required: true, maxlength: 100 },
   description: { type: String, required: true, maxlength: 200 },
   backgroundImage: { public_id: String, url: String },
   serviceType: { type: String, enum: ['both', 'viewalbum', 'uploadpics'], default: 'both' },
-  uploadLimit: { 
-    type: Number, 
-    default: 100,
-    min: 50,
-    max: 5000
-  },
+  uploadLimit: { type: Number, default: 5, min: 1, max: 20 },
   preloadedPhotos: [{ public_id: String, url: String, uploadedAt: { type: Date, default: Date.now } }],
   createdBy: { type: String, required: true },
   status: { type: String, enum: ['active', 'disabled'], default: 'active' },
   createdAt: { type: Date, default: Date.now }
-});
+}));
 
-const photoSchema = new mongoose.Schema({
+const Photo = mongoose.model('Photo', new mongoose.Schema({
   eventId: { type: String, required: true },
   public_id: { type: String, required: true },
   url: { type: String, required: true },
@@ -54,192 +50,169 @@ const photoSchema = new mongoose.Schema({
   uploaderInfo: { ip: String, userAgent: String },
   approved: { type: Boolean, default: true },
   uploadedAt: { type: Date, default: Date.now }
-});
+}));
 
-const Event = mongoose.model('Event', eventSchema);
-const Photo = mongoose.model('Photo', photoSchema);
-
-// Initialize Telegram Bot only if token exists
-let bot;
+// Telegram Bot
+const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN);
 const userStates = new Map();
 
-if (process.env.TELEGRAM_BOT_TOKEN) {
-  bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN);
+// Cloudinary Helper
+const uploadToCloudinary = async (imagePath, folder = 'events') => {
+  const result = await cloudinary.uploader.upload(imagePath, { folder, quality: 'auto' });
+  return { public_id: result.public_id, url: result.secure_url };
+};
+
+// Generate Event ID
+const generateEventId = () => 'EVT_' + Math.random().toString(36).substr(2, 9).toUpperCase();
+
+// Bot Start Command
+bot.start(async (ctx) => {
+  const eventId = generateEventId();
+  const userId = ctx.from.id.toString();
   
-  // Cloudinary Helper
-  const uploadToCloudinary = async (imagePath, folder = 'events') => {
-    const result = await cloudinary.uploader.upload(imagePath, { folder, quality: 'auto' });
-    return { public_id: result.public_id, url: result.secure_url };
-  };
-
-  // Generate Event ID
-  const generateEventId = () => 'EVT_' + Math.random().toString(36).substr(2, 9).toUpperCase();
-
-  // Bot Start Command
-  bot.start(async (ctx) => {
-    const eventId = generateEventId();
-    const userId = ctx.from.id.toString();
-    
-    userStates.set(userId, {
-      step: 'welcomeText',
-      eventData: { eventId, createdBy: userId }
-    });
-
-    await ctx.reply(`🎉 Event Created! ID: ${eventId}\nEnter welcome text (max 100 chars):`);
+  userStates.set(userId, {
+    step: 'welcomeText',
+    eventData: { eventId, createdBy: userId }
   });
 
-  // Bot Text Handler
-  bot.on('text', async (ctx) => {
-    const userId = ctx.from.id.toString();
-    const userState = userStates.get(userId);
-    if (!userState) return;
+  await ctx.reply(`🎉 Event Created! ID: ${eventId}\nEnter welcome text (max 100 chars):`);
+});
 
-    const text = ctx.message.text;
+// Bot Text Handler
+bot.on('text', async (ctx) => {
+  const userId = ctx.from.id.toString();
+  const userState = userStates.get(userId);
+  if (!userState) return;
 
-    switch (userState.step) {
-      case 'welcomeText':
-        if (text.length > 100) {
-          await ctx.reply('❌ Too long! Max 100 chars:');
-          return;
-        }
-        userState.eventData.welcomeText = text;
-        userState.step = 'description';
-        await ctx.reply('✅ Now enter description (max 200 chars):');
-        break;
+  const text = ctx.message.text;
 
-      case 'description':
-        if (text.length > 200) {
-          await ctx.reply('❌ Too long! Max 200 chars:');
-          return;
-        }
-        userState.eventData.description = text;
-        userState.step = 'backgroundImage';
-        await ctx.reply('✅ Now send background image:');
-        break;
+  switch (userState.step) {
+    case 'welcomeText':
+      if (text.length > 100) return ctx.reply('❌ Too long! Max 100 chars:');
+      userState.eventData.welcomeText = text;
+      userState.step = 'description';
+      await ctx.reply('✅ Now enter description (max 200 chars):');
+      break;
 
-      case 'serviceType':
-        if (!['/both', '/viewalbum', '/uploadpics'].includes(text)) {
-          await ctx.reply('❌ Use /both, /viewalbum, or /uploadpics');
-          return;
-        }
-        userState.eventData.serviceType = text.replace('/', '');
-        userState.step = 'uploadLimit';
-        await ctx.reply('✅ Enter upload limit (50-5000):');
-        break;
+    case 'description':
+      if (text.length > 200) return ctx.reply('❌ Too long! Max 200 chars:');
+      userState.eventData.description = text;
+      userState.step = 'backgroundImage';
+      await ctx.reply('✅ Now send background image:');
+      break;
 
-      case 'uploadLimit':
-        const limit = parseInt(text);
-        if (isNaN(limit) || limit < 50 || limit > 5000) {
-          await ctx.reply('❌ Enter number 50-5000:');
-          return;
-        }
-        userState.eventData.uploadLimit = limit;
-        userState.step = 'preloadedPhotos';
-        await ctx.reply('✅ Now send preloaded photos (type /done when finished):');
-        break;
+    case 'serviceType':
+      if (!['/both', '/viewalbum', '/uploadpics'].includes(text))
+        return ctx.reply('❌ Use /both, /viewalbum, or /uploadpics');
+      userState.eventData.serviceType = text.replace('/', '');
+      userState.step = 'uploadLimit';
+      await ctx.reply('✅ Enter upload limit (1-20):');
+      break;
 
-      case 'eventIdForDisable':
-        try {
-          const event = await Event.findOne({ eventId: text });
-          if (!event) {
-            await ctx.reply('❌ Event not found');
-            return;
-          }
-          event.status = 'disabled';
-          await event.save();
-          await ctx.reply(`✅ Uploads disabled for event: ${text}`);
-        } catch (error) {
-          await ctx.reply('❌ Failed to disable event');
-        }
-        userStates.delete(userId);
-        break;
-    }
+    case 'uploadLimit':
+      const limit = parseInt(text);
+      if (isNaN(limit) || limit < 1 || limit > 20)
+        return ctx.reply('❌ Enter number 1-20:');
+      userState.eventData.uploadLimit = limit;
+      userState.step = 'preloadedPhotos';
+      await ctx.reply('✅ Send preloaded photos (type /done when finished):');
+      break;
 
-    userStates.set(userId, userState);
-  });
-
-  // Bot Photo Handler
-  bot.on('photo', async (ctx) => {
-    const userId = ctx.from.id.toString();
-    const userState = userStates.get(userId);
-    if (!userState) return;
-
-    try {
-      const fileId = ctx.message.photo[ctx.message.photo.length - 1].file_id;
-      const fileLink = await bot.telegram.getFileLink(fileId);
-      const tempPath = `temp-${Date.now()}.jpg`;
-      
-      // Download image using https
-      const fileStream = fs.createWriteStream(tempPath);
-      https.get(fileLink.href, (response) => {
-        response.pipe(fileStream);
-        fileStream.on('finish', async () => {
-          fileStream.close();
-          
-          if (userState.step === 'backgroundImage') {
-            const uploadResult = await uploadToCloudinary(tempPath, 'events/backgrounds');
-            userState.eventData.backgroundImage = uploadResult;
-            userState.step = 'serviceType';
-            await ctx.reply('✅ Background set! Choose: /both, /viewalbum, or /uploadpics');
-          } else if (userState.step === 'preloadedPhotos') {
-            if (!userState.eventData.preloadedPhotos) userState.eventData.preloadedPhotos = [];
-            const uploadResult = await uploadToCloudinary(tempPath, 'events/preloaded');
-            userState.eventData.preloadedPhotos.push(uploadResult);
-            await ctx.reply('✅ Photo added! Send more or /done');
-          }
-          
-          fs.unlinkSync(tempPath);
-          userStates.set(userId, userState);
-        });
-      });
-    } catch (error) {
-      console.error('Photo upload error:', error);
-      await ctx.reply('❌ Failed to upload image');
-    }
-  });
-
-  // Bot /done Command
-  bot.command('done', async (ctx) => {
-    const userId = ctx.from.id.toString();
-    const userState = userStates.get(userId);
-    
-    if (userState && userState.step === 'preloadedPhotos') {
+    case 'eventIdForDisable':
       try {
-        const event = new Event(userState.eventData);
+        const event = await Event.findOne({ eventId: text });
+        if (!event) return ctx.reply('❌ Event not found');
+        event.status = 'disabled';
         await event.save();
-
-        // Save preloaded photos to Photo collection
-        if (userState.eventData.preloadedPhotos) {
-          for (const photo of userState.eventData.preloadedPhotos) {
-            await new Photo({
-              eventId: userState.eventData.eventId,
-              public_id: photo.public_id,
-              url: photo.url,
-              uploadType: 'preloaded'
-            }).save();
-          }
-        }
-
-        const eventUrl = `${process.env.FRONTEND_URL}/event/${userState.eventData.eventId}`;
-        await ctx.reply(`🎊 Event Complete!\nID: ${userState.eventData.eventId}\nURL: ${eventUrl}\nUse /disable to stop uploads.`);
+        await ctx.reply(`✅ Uploads disabled for event: ${text}`);
       } catch (error) {
-        console.error('Event creation error:', error);
-        await ctx.reply('❌ Failed to create event');
+        console.error('Disable error:', error);
+        await ctx.reply('❌ Failed to disable event');
       }
       userStates.delete(userId);
+      break;
+  }
+
+  userStates.set(userId, userState);
+});
+
+// Bot Photo Handler
+bot.on('photo', async (ctx) => {
+  const userId = ctx.from.id.toString();
+  const userState = userStates.get(userId);
+  if (!userState) return;
+
+  try {
+    const fileId = ctx.message.photo.at(-1).file_id;
+    const fileLink = await bot.telegram.getFileLink(fileId);
+    const tempPath = `temp-${Date.now()}.jpg`;
+    
+    // Download image using fetch
+    const response = await fetch(fileLink.href);
+    const buffer = await response.arrayBuffer();
+    fs.writeFileSync(tempPath, Buffer.from(buffer));
+    
+    if (userState.step === 'backgroundImage') {
+      const uploadResult = await uploadToCloudinary(tempPath, 'events/backgrounds');
+      userState.eventData.backgroundImage = uploadResult;
+      userState.step = 'serviceType';
+      await ctx.reply('✅ Background set! Choose: /both, /viewalbum, or /uploadpics');
+    } else if (userState.step === 'preloadedPhotos') {
+      if (!userState.eventData.preloadedPhotos) userState.eventData.preloadedPhotos = [];
+      const uploadResult = await uploadToCloudinary(tempPath, 'events/preloaded');
+      userState.eventData.preloadedPhotos.push(uploadResult);
+      await ctx.reply('✅ Photo added! Send more or /done');
     }
-  });
+    
+    fs.unlinkSync(tempPath);
+    userStates.set(userId, userState);
+  } catch (error) {
+    console.error('Photo upload error:', error);
+    await ctx.reply('❌ Failed to upload image');
+  }
+});
 
-  // Bot /disable Command
-  bot.command('disable', (ctx) => {
-    const userId = ctx.from.id.toString();
-    userStates.set(userId, { step: 'eventIdForDisable' });
-    ctx.reply('Enter Event ID to disable uploads:');
-  });
+// Bot /done Command
+bot.command('done', async (ctx) => {
+  const userId = ctx.from.id.toString();
+  const userState = userStates.get(userId);
+  
+  if (userState && userState.step === 'preloadedPhotos') {
+    try {
+      const event = new Event(userState.eventData);
+      await event.save();
 
-  // Start Bot only when server starts, not during build
-  console.log('🤖 Telegram Bot initialized (will start with server)');
-}
+      // Save preloaded photos
+      if (userState.eventData.preloadedPhotos) {
+        for (const photo of userState.eventData.preloadedPhotos) {
+          await new Photo({
+            eventId: userState.eventData.eventId,
+            public_id: photo.public_id,
+            url: photo.url,
+            uploadType: 'preloaded'
+          }).save();
+        }
+      }
+
+      const eventUrl = `${process.env.FRONTEND_URL}/event/${userState.eventData.eventId}`;
+      await ctx.reply(`🎊 Event Complete!\nID: ${userState.eventData.eventId}\nURL: ${eventUrl}\nUse /disable to stop uploads.`);
+    } catch (error) {
+      console.error('Event creation error:', error);
+      await ctx.reply('❌ Failed to create event');
+    }
+    userStates.delete(userId);
+  }
+});
+
+// Bot /disable Command
+bot.command('disable', (ctx) => {
+  const userId = ctx.from.id.toString();
+  userStates.set(userId, { step: 'eventIdForDisable' });
+  ctx.reply('Enter Event ID to disable uploads:');
+});
+
+// Start Bot
+bot.launch().then(() => console.log('🤖 Telegram Bot Started'));
 
 // API Routes
 const upload = multer({ dest: 'uploads/' });
@@ -285,16 +258,13 @@ app.post('/api/upload/:eventId', upload.single('photo'), async (req, res) => {
     }
 
     // Upload to Cloudinary
-    const uploadResult = await cloudinary.uploader.upload(req.file.path, { 
-      folder: `events/${req.params.eventId}`,
-      quality: 'auto'
-    });
+    const uploadResult = await uploadToCloudinary(req.file.path, `events/${req.params.eventId}`);
 
     // Save to database
     const photo = new Photo({
       eventId: req.params.eventId,
       public_id: uploadResult.public_id,
-      url: uploadResult.secure_url,
+      url: uploadResult.url,
       uploadType: 'guest',
       uploaderInfo: { ip: req.ip, userAgent: req.get('User-Agent') }
     });
@@ -309,34 +279,14 @@ app.post('/api/upload/:eventId', upload.single('photo'), async (req, res) => {
   }
 });
 
-// Get Album Photos
-app.get('/api/album/:eventId', async (req, res) => {
-  try {
-    const preloadedPhotos = await Photo.find({ eventId: req.params.eventId, uploadType: 'preloaded' }).sort({ uploadedAt: -1 });
-    const guestPhotos = await Photo.find({ eventId: req.params.eventId, uploadType: 'guest', approved: true }).sort({ uploadedAt: -1 });
-    res.json({ preloadedPhotos, guestPhotos });
-  } catch (error) {
-    console.error('Album API error:', error);
-    res.status(500).json({ error: 'Server error' });
-  }
-});
-
 // Health Check
 app.get('/health', (req, res) => {
   res.json({ status: 'OK', timestamp: new Date().toISOString() });
 });
 
-// Root endpoint
-app.get('/', (req, res) => {
-  res.json({ message: 'Event Photo Backend is running!' });
-});
-
 // Start Server
 const PORT = process.env.PORT || 5000;
-app.listen(PORT, '0.0.0.0', () => {
+app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
-  // Start bot only after server is running
-  if (bot) {
-    bot.launch().then(() => console.log('🤖 Telegram Bot Started'));
-  }
 });
+
