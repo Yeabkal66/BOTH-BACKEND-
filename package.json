@@ -1,7 +1,7 @@
 ﻿{
   "name": "event-photo-backend",
   "version": "1.0.0",
-  "description": "Backend for event photo system",
+  "type": "commonjs",  // ADD THIS LINE
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
@@ -14,9 +14,7 @@
     "telegraf": "^4.12.2",
     "multer": "^1.4.5",
     "dotenv": "^16.3.1",
-    "cors": "^2.8.5"
-  },
-  "devDependencies": {
-    "nodemon": "^3.0.1"
+    "cors": "^2.8.5",
+    "node-fetch": "^2.6.7"  // ADD THIS
   }
-}
+ }
