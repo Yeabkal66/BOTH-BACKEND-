@@ -1,11 +1,13 @@
-﻿const express = require('express');
+require('dotenv').config();
+
+const express = require('express');
 const mongoose = require('mongoose');
 const cors = require('cors');
 const { Telegraf } = require('telegraf');
 const cloudinary = require('cloudinary').v2;
 const multer = require('multer');
 const fs = require('fs');
-require('dotenv').config();
+const fetch = require('node-fetch');
 
 const app = express();
 app.use(cors());
@@ -15,7 +17,8 @@ app.use(express.json());
 mongoose.connect(process.env.MONGODB_URI, {
   useNewUrlParser: true,
   useUnifiedTopology: true,
-}).then(() => console.log('✅ MongoDB Connected'));
+}).then(() => console.log('✅ MongoDB Connected'))
+.catch(err => console.error('❌ MongoDB Error:', err));
 
 // Cloudinary Config
 cloudinary.config({
@@ -25,20 +28,25 @@ cloudinary.config({
 });
 
 // MongoDB Models
-const Event = mongoose.model('Event', new mongoose.Schema({
+const eventSchema = new mongoose.Schema({
   eventId: { type: String, required: true, unique: true },
   welcomeText: { type: String, required: true, maxlength: 100 },
   description: { type: String, required: true, maxlength: 200 },
   backgroundImage: { public_id: String, url: String },
   serviceType: { type: String, enum: ['both', 'viewalbum', 'uploadpics'], default: 'both' },
-  uploadLimit: { type: Number, default: 5, min: 1, max: 20 },
+  uploadLimit: { 
+    type: Number, 
+    default: 100,
+    min: 50,
+    max: 5000
+  },
   preloadedPhotos: [{ public_id: String, url: String, uploadedAt: { type: Date, default: Date.now } }],
   createdBy: { type: String, required: true },
   status: { type: String, enum: ['active', 'disabled'], default: 'active' },
   createdAt: { type: Date, default: Date.now }
-}));
+});
 
-const Photo = mongoose.model('Photo', new mongoose.Schema({
+const photoSchema = new mongoose.Schema({
   eventId: { type: String, required: true },
   public_id: { type: String, required: true },
   url: { type: String, required: true },
@@ -46,7 +54,10 @@ const Photo = mongoose.model('Photo', new mongoose.Schema({
   uploaderInfo: { ip: String, userAgent: String },
   approved: { type: Boolean, default: true },
   uploadedAt: { type: Date, default: Date.now }
-}));
+});
+
+const Event = mongoose.model('Event', eventSchema);
+const Photo = mongoose.model('Photo', photoSchema);
 
 // Telegram Bot
 const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN);
@@ -110,18 +121,18 @@ bot.on('text', async (ctx) => {
       }
       userState.eventData.serviceType = text.replace('/', '');
       userState.step = 'uploadLimit';
-      await ctx.reply('✅ Enter upload limit (1-20):');
+      await ctx.reply('✅ Enter upload limit (50-5000):');
       break;
 
     case 'uploadLimit':
       const limit = parseInt(text);
-      if (isNaN(limit) || limit < 1 || limit > 20) {
-        await ctx.reply('❌ Enter number 1-20:');
+      if (isNaN(limit) || limit < 50 || limit > 5000) {
+        await ctx.reply('❌ Enter number 50-5000:');
         return;
       }
       userState.eventData.uploadLimit = limit;
       userState.step = 'preloadedPhotos';
-      await ctx.reply('✅ Send preloaded photos (type /done when finished):');
+      await ctx.reply('✅ Now send preloaded photos (type /done when finished):');
       break;
 
     case 'eventIdForDisable':
@@ -155,10 +166,10 @@ bot.on('photo', async (ctx) => {
     const fileLink = await bot.telegram.getFileLink(fileId);
     const tempPath = `temp-${Date.now()}.jpg`;
     
-    // Download image
+    // Download image using node-fetch
     const response = await fetch(fileLink.href);
-    const buffer = await response.arrayBuffer();
-    fs.writeFileSync(tempPath, Buffer.from(buffer));
+    const buffer = await response.buffer();
+    fs.writeFileSync(tempPath, buffer);
     
     if (userState.step === 'backgroundImage') {
       const uploadResult = await uploadToCloudinary(tempPath, 'events/backgrounds');
@@ -175,6 +186,7 @@ bot.on('photo', async (ctx) => {
     fs.unlinkSync(tempPath);
     userStates.set(userId, userState);
   } catch (error) {
+    console.error('Photo upload error:', error);
     await ctx.reply('❌ Failed to upload image');
   }
 });
@@ -189,7 +201,7 @@ bot.command('done', async (ctx) => {
       const event = new Event(userState.eventData);
       await event.save();
 
-      // Save preloaded photos
+      // Save preloaded photos to Photo collection
       if (userState.eventData.preloadedPhotos) {
         for (const photo of userState.eventData.preloadedPhotos) {
           await new Photo({
@@ -204,6 +216,7 @@ bot.command('done', async (ctx) => {
       const eventUrl = `${process.env.FRONTEND_URL}/event/${userState.eventData.eventId}`;
       await ctx.reply(`🎊 Event Complete!\nID: ${userState.eventData.eventId}\nURL: ${eventUrl}\nUse /disable to stop uploads.`);
     } catch (error) {
+      console.error('Event creation error:', error);
       await ctx.reply('❌ Failed to create event');
     }
     userStates.delete(userId);
@@ -239,6 +252,7 @@ app.get('/api/events/:eventId', async (req, res) => {
       uploadEnabled: event.status === 'active' && event.serviceType !== 'viewalbum'
     });
   } catch (error) {
+    console.error('Events API error:', error);
     res.status(500).json({ error: 'Server error' });
   }
 });
@@ -279,6 +293,7 @@ app.post('/api/upload/:eventId', upload.single('photo'), async (req, res) => {
 
     res.json({ success: true, photo });
   } catch (error) {
+    console.error('Upload API error:', error);
     res.status(500).json({ error: 'Upload failed' });
   }
 });
@@ -290,6 +305,7 @@ app.get('/api/album/:eventId', async (req, res) => {
     const guestPhotos = await Photo.find({ eventId: req.params.eventId, uploadType: 'guest', approved: true }).sort({ uploadedAt: -1 });
     res.json({ preloadedPhotos, guestPhotos });
   } catch (error) {
+    console.error('Album API error:', error);
     res.status(500).json({ error: 'Server error' });
   }
 });
@@ -299,8 +315,13 @@ app.get('/health', (req, res) => {
   res.json({ status: 'OK', timestamp: new Date().toISOString() });
 });
 
+// Root endpoint
+app.get('/', (req, res) => {
+  res.json({ message: 'Event Photo Backend is running!' });
+});
+
 // Start Server
 const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => {
+app.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 Server running on port ${PORT}`);
-});
+}); 
